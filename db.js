@@ -106,6 +106,8 @@ function addColumn(table, definition) {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all();
   if (!columns.some(c => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
 }
+addColumn('users', 'github_id TEXT');
+addColumn('users', 'google_id TEXT');
 addColumn('spaces', 'invite_code TEXT');
 addColumn('channel_messages', 'reply_to_id INTEGER');
 addColumn('direct_messages', 'reply_to_id INTEGER');

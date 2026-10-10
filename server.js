@@ -19,7 +19,7 @@ const io = new Server(server, { maxHttpBufferSize: 100_000 });
 const PORT = Number(process.env.PORT) || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-this-secret';
 const publicDir = path.join(__dirname, 'public');
-const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname,'data','uploads');
+const uploadDir = process.env.UPLOAD_DIR || path.join(process.env.DATA_DIR || path.join(__dirname,'data'),'uploads');
 fs.mkdirSync(uploadDir,{recursive:true});
 const allowedMime=new Set(['image/jpeg','image/png','image/webp','image/gif','application/pdf','text/plain']);
 const upload=multer({storage:multer.diskStorage({destination:uploadDir,filename:(_req,file,done)=>{const ext=path.extname(file.originalname).toLowerCase().replace(/[^.a-z0-9]/g,'').slice(0,8);done(null,`${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`)}}),limits:{fileSize:8*1024*1024},fileFilter:(_req,file,done)=>done(allowedMime.has(file.mimetype)?null:new Error('Недоступный тип файла'),allowedMime.has(file.mimetype))});
@@ -42,6 +42,31 @@ async function deliverCode(email, code) {
     html: `<div style="font-family:Arial;padding:24px;background:#0d1018;color:#fff"><h2>Pulse</h2><p>Код подтверждения:</p><div style="font-size:32px;letter-spacing:8px;font-weight:800">${code}</div><p style="color:#9ca3af">Код действует 10 минут.</p></div>`
   });
   return true;
+}
+
+function findOrCreateSocialUser(provider, providerId, email, displayName) {
+  const column = provider === 'google' ? 'google_id' : 'github_id';
+  email = String(email || `${providerId}@users.noreply.${provider}.com`).toLowerCase();
+  let user = db.prepare(`SELECT * FROM users WHERE ${column}=? OR email=? COLLATE NOCASE`).get(String(providerId), email);
+  if (user) {
+    db.prepare(`UPDATE users SET ${column}=? WHERE id=?`).run(String(providerId), user.id);
+    return db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+  }
+  const baseName = clean(displayName || `${provider} user`, 24) || `${provider} user`;
+  let username = baseName, n = 1;
+  while (db.prepare('SELECT 1 FROM users WHERE username=? COLLATE NOCASE').get(username)) username = `${baseName.slice(0,20)}${++n}`;
+  const hash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10), colors = ['#8b5cf6','#06b6d4','#ec4899','#22c55e','#f59e0b'];
+  const out = db.prepare(`INSERT INTO users(username,email,password_hash,accent,${column}) VALUES(?,?,?,?,?)`).run(username,email,hash,colors[Math.abs(Number(providerId)||0)%colors.length],String(providerId));
+  user = db.prepare('SELECT * FROM users WHERE id=?').get(out.lastInsertRowid);
+  let welcome = db.prepare('SELECT id FROM spaces ORDER BY id LIMIT 1').get();
+  if (!welcome) {
+    const s = db.prepare("INSERT INTO spaces(name,description,icon,owner_id,invite_code) VALUES('Орбита','Общее пространство для первых разговоров','◉',?,?)").run(user.id,inviteCode());
+    welcome = {id:Number(s.lastInsertRowid)};
+    db.prepare("INSERT INTO channels(space_id,name,topic) VALUES(?,'общий','Знакомства, идеи и живые разговоры')").run(welcome.id);
+    db.prepare("INSERT INTO channels(space_id,name,topic) VALUES(?,'проекты','Делимся тем, над чем работаем')").run(welcome.id);
+  }
+  db.prepare("INSERT OR IGNORE INTO space_members(space_id,user_id,role) VALUES(?,?,?)").run(welcome.id,user.id,user.id===1?'owner':'member');
+  return user;
 }
 
 app.set('trust proxy', 1);
@@ -76,9 +101,49 @@ function messageView(row) {
     user: { id: row.user_id, username: row.username, accent: row.accent, status: row.status_text } };
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'Pulse', version:'1.4.2', updated:'2026-10-09' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'Pulse', version:'1.6.0', updated:'2026-10-09' }));
 app.post('/api/upload',auth,(req,res)=>upload.single('file')(req,res,err=>{if(err)return res.status(400).json({error:err.code==='LIMIT_FILE_SIZE'?'Файл больше 8 МБ':err.message||'Не удалось загрузить файл'});if(!req.file)return res.status(400).json({error:'Файл не выбран.'});res.status(201).json({url:`/uploads/${req.file.filename}`,name:clean(req.file.originalname,120),type:req.file.mimetype,size:req.file.size})}));
-app.get('/api/config',(_req,res)=>{const iceServers=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];if(process.env.TURN_URL)iceServers.push({urls:process.env.TURN_URL,username:process.env.TURN_USERNAME||'',credential:process.env.TURN_CREDENTIAL||''});res.json({iceServers,voice:true})});
+app.get('/api/config',(_req,res)=>{const iceServers=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];if(process.env.TURN_URL)iceServers.push({urls:process.env.TURN_URL,username:process.env.TURN_USERNAME||'',credential:process.env.TURN_CREDENTIAL||''});res.json({iceServers,voice:true,githubAuth:!!(process.env.GITHUB_CLIENT_ID&&process.env.GITHUB_CLIENT_SECRET),googleAuth:!!(process.env.GOOGLE_CLIENT_ID&&process.env.GOOGLE_CLIENT_SECRET)})});
+
+app.get('/api/auth/github',(req,res)=>{
+  if(!process.env.GITHUB_CLIENT_ID||!process.env.GITHUB_CLIENT_SECRET)return res.redirect('/#oauth_error=GitHub вход не настроен');
+  const base=process.env.PUBLIC_URL||`${req.protocol}://${req.get('host')}`,redirectUri=`${base}/api/auth/github/callback`,state=jwt.sign({purpose:'github',base},JWT_SECRET,{expiresIn:'10m'});
+  const url=new URL('https://github.com/login/oauth/authorize');url.searchParams.set('client_id',process.env.GITHUB_CLIENT_ID);url.searchParams.set('redirect_uri',redirectUri);url.searchParams.set('scope','read:user user:email');url.searchParams.set('state',state);res.redirect(url.toString());
+});
+app.get('/api/auth/github/callback',async(req,res)=>{
+  let payload;try{payload=jwt.verify(String(req.query.state||''),JWT_SECRET);if(payload.purpose!=='github')throw new Error('state')}catch{return res.redirect('/#oauth_error=Сессия GitHub истекла')}
+  const base=process.env.PUBLIC_URL||payload.base||`${req.protocol}://${req.get('host')}`;
+  if(req.query.error)return res.redirect(`/#oauth_error=${encodeURIComponent('GitHub отменил авторизацию')}`);
+  try{
+    const tokenRes=await fetch('https://github.com/login/oauth/access_token',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({client_id:process.env.GITHUB_CLIENT_ID,client_secret:process.env.GITHUB_CLIENT_SECRET,code:req.query.code,redirect_uri:`${base}/api/auth/github/callback`})});const tokenData=await tokenRes.json();if(!tokenData.access_token)throw new Error('GitHub не выдал токен');
+    const headers={Authorization:`Bearer ${tokenData.access_token}`,Accept:'application/vnd.github+json','User-Agent':'Pulse-Chat'};const profile=await (await fetch('https://api.github.com/user',{headers})).json();if(!profile.id)throw new Error('Профиль GitHub недоступен');
+    let email=profile.email;if(!email){const emails=await (await fetch('https://api.github.com/user/emails',{headers})).json();email=Array.isArray(emails)?(emails.find(x=>x.primary&&x.verified)||emails.find(x=>x.verified))?.email:null}email=(email||`${profile.id}@users.noreply.github.com`).toLowerCase();
+    let user=db.prepare('SELECT * FROM users WHERE github_id=? OR email=? COLLATE NOCASE').get(String(profile.id),email);
+    if(user){db.prepare('UPDATE users SET github_id=? WHERE id=?').run(String(profile.id),user.id);user=db.prepare('SELECT * FROM users WHERE id=?').get(user.id)}else{
+      const baseName=clean(profile.name||profile.login||'GitHub User',24)||'GitHub User';let username=baseName,n=1;while(db.prepare('SELECT 1 FROM users WHERE username=? COLLATE NOCASE').get(username))username=`${baseName.slice(0,20)}${++n}`;
+      const hash=bcrypt.hashSync(crypto.randomBytes(32).toString('hex'),10),colors=['#8b5cf6','#06b6d4','#ec4899','#22c55e','#f59e0b'];const out=db.prepare('INSERT INTO users(username,email,password_hash,accent,github_id) VALUES(?,?,?,?,?)').run(username,email,hash,colors[profile.id%colors.length],String(profile.id));user=db.prepare('SELECT * FROM users WHERE id=?').get(out.lastInsertRowid);
+      let welcome=db.prepare('SELECT id FROM spaces ORDER BY id LIMIT 1').get();if(!welcome){const s=db.prepare("INSERT INTO spaces(name,description,icon,owner_id,invite_code) VALUES('Орбита','Общее пространство для первых разговоров','◉',?,?)").run(user.id,inviteCode());welcome={id:Number(s.lastInsertRowid)};db.prepare("INSERT INTO channels(space_id,name,topic) VALUES(?,'общий','Знакомства, идеи и живые разговоры')").run(welcome.id);db.prepare("INSERT INTO channels(space_id,name,topic) VALUES(?,'проекты','Делимся тем, над чем работаем')").run(welcome.id)}db.prepare("INSERT OR IGNORE INTO space_members(space_id,user_id,role) VALUES(?,?,?)").run(welcome.id,user.id,user.id===1?'owner':'member');
+    }
+    const appToken=tokenFor(user);res.redirect(`/#oauth_token=${encodeURIComponent(appToken)}`)
+  }catch(e){console.error('GitHub OAuth:',e);res.redirect(`/#oauth_error=${encodeURIComponent('Не удалось войти через GitHub')}`)}
+});
+
+app.get('/api/auth/google',(req,res)=>{
+  if(!process.env.GOOGLE_CLIENT_ID||!process.env.GOOGLE_CLIENT_SECRET)return res.redirect('/#oauth_error=Google вход не настроен');
+  const base=process.env.PUBLIC_URL||`${req.protocol}://${req.get('host')}`,redirectUri=`${base}/api/auth/google/callback`,state=jwt.sign({purpose:'google',base},JWT_SECRET,{expiresIn:'10m'});
+  const url=new URL('https://accounts.google.com/o/oauth2/v2/auth');url.searchParams.set('client_id',process.env.GOOGLE_CLIENT_ID);url.searchParams.set('redirect_uri',redirectUri);url.searchParams.set('response_type','code');url.searchParams.set('scope','openid email profile');url.searchParams.set('state',state);url.searchParams.set('prompt','select_account');res.redirect(url.toString());
+});
+app.get('/api/auth/google/callback',async(req,res)=>{
+  let payload;try{payload=jwt.verify(String(req.query.state||''),JWT_SECRET);if(payload.purpose!=='google')throw new Error('state')}catch{return res.redirect('/#oauth_error=Сессия Google истекла')}
+  const base=process.env.PUBLIC_URL||payload.base||`${req.protocol}://${req.get('host')}`;
+  if(req.query.error)return res.redirect(`/#oauth_error=${encodeURIComponent('Google отменил авторизацию')}`);
+  try{
+    const body=new URLSearchParams({client_id:process.env.GOOGLE_CLIENT_ID,client_secret:process.env.GOOGLE_CLIENT_SECRET,code:String(req.query.code||''),grant_type:'authorization_code',redirect_uri:`${base}/api/auth/google/callback`});
+    const tokenRes=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const tokenData=await tokenRes.json();if(!tokenData.access_token)throw new Error('Google не выдал токен');
+    const profile=await (await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:`Bearer ${tokenData.access_token}`}})).json();if(!profile.sub||!profile.email)throw new Error('Профиль Google недоступен');
+    const user=findOrCreateSocialUser('google',profile.sub,profile.email,profile.name||profile.email.split('@')[0]);res.redirect(`/#oauth_token=${encodeURIComponent(tokenFor(user))}`)
+  }catch(e){console.error('Google OAuth:',e);res.redirect(`/#oauth_error=${encodeURIComponent('Не удалось войти через Google')}`)}
+});
 
 app.post('/api/auth/register', async (req, res) => {
   const username = clean(req.body.username, 24).replace(/\s+/g, ' ');
@@ -96,7 +161,7 @@ app.post('/api/auth/register', async (req, res) => {
       code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0`).run(email, username, hash, codeHash(email, code), Date.now() + 10 * 60 * 1000);
     const sent = await deliverCode(email, code);
     console.log(`Код Pulse для ${email}: ${code}`);
-    res.json({ verificationRequired:true, email, sent, ...(process.env.NODE_ENV !== 'production' ? { devCode:code } : {}) });
+    res.json({ verificationRequired:true, email, sent, ...(!sent || process.env.NODE_ENV !== 'production' ? { devCode:code } : {}) });
   } catch (e) { console.error(e); res.status(500).json({ error:'Не удалось отправить код.' }); }
 });
 
